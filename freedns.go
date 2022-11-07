@@ -5,14 +5,8 @@ package freedns
 
 import (
 	"context"
-	"encoding/json"
-	"io/ioutil"
 	"math"
-	"net/http"
 	"strings"
-
-	// "fmt"
-	// "os"
 
 	log "github.com/sirupsen/logrus"
 
@@ -22,7 +16,12 @@ import (
 	"sigs.k8s.io/external-dns/provider"
 )
 
-const minimumTTL = 3600
+const (
+  minimumTTL = 3600
+  recordTypeA = endpoint.RecordTypeA
+)
+
+var publicIP string
 
 // FreeDNSProvider implements the DNS provider spec for UKFast FreeDNS.
 type FreeDNSProvider struct {
@@ -41,6 +40,12 @@ func NewFreeDNSProvider(domainFilter endpoint.DomainFilter, dryRun bool) (*FreeD
 		domainFilter: domainFilter,
 		DryRun:       dryRun,
 	}
+
+	publicIP, err = getPublicIP()
+	if err != nil {
+		return nil, err
+	}
+
 	return provider, err
 }
 
@@ -70,31 +75,6 @@ func (p *FreeDNSProvider) Records(ctx context.Context) ([]*endpoint.Endpoint, er
 	}
 	return endpoints, nil
 }
-
-// GET PUBLIC IP
-type IP struct {
-	Query string
-}
-
-func getPublicIP() (string, error) {
-	req, err := http.Get("http://ip-api.com/json/")
-	if err != nil {
-		return "", err
-	}
-	defer req.Body.Close()
-
-	body, err := ioutil.ReadAll(req.Body)
-	if err != nil {
-		return "", err
-	}
-
-	var ip IP
-	json.Unmarshal(body, &ip)
-
-	return ip.Query, nil
-}
-
-// GET PUBLIC IP END
 
 // ApplyChanges applies a given set of changes in a given zone.
 func (p *FreeDNSProvider) ApplyChanges(ctx context.Context, changes *plan.Changes) error {
@@ -127,30 +107,30 @@ func (p *FreeDNSProvider) ApplyChanges(ctx context.Context, changes *plan.Change
 		zoneId, zoneName := zoneNameIDMapper.FindZone(endpoint.DNSName)
 		ttl := int(math.Max(minimumTTL, float64(endpoint.RecordTTL)))
 		// Avoid adding all service endpoints and just add the externalIP
-		// for _, target := range endpoint.Targets {
-		target, err := getPublicIP()
-		if err != nil {
-			return err
-		}
-		log.WithFields(log.Fields{
-			"zoneID":     zoneId,
-			"zoneName":   zoneName,
-			"dnsName":    endpoint.DNSName,
-			"recordType": endpoint.RecordType,
-			"target":     target,
-			"TTL":        ttl,
-		}).Infof("%sCreating record", dryRunText)
-		if p.DryRun {
-			continue
-		}
+		for _, target := range endpoint.Targets {
+			if endpoint.RecordType == recordTypeA {
+				target = publicIP
+			}
 
-		// Create DNS record
-		recordName := strings.TrimSuffix(endpoint.DNSName, "."+zoneName)
-		err = p.Client.CreateRecord(zoneId, recordName, endpoint.RecordType, target, string(ttl))
-		if err != nil {
-			return err
+			log.WithFields(log.Fields{
+				"zoneID":     zoneId,
+				"zoneName":   zoneName,
+				"dnsName":    endpoint.DNSName,
+				"recordType": endpoint.RecordType,
+				"target":     target,
+				"TTL":        ttl,
+			}).Infof("%sCreating record", dryRunText)
+			if p.DryRun {
+				continue
+			}
+
+			// Create DNS record
+			recordName := strings.TrimSuffix(endpoint.DNSName, "."+zoneName)
+			err = p.Client.CreateRecord(zoneId, recordName, endpoint.RecordType, target, string(ttl))
+			if err != nil {
+				return err
+			}
 		}
-		//}
 	}
 
 	for _, endpoint := range changes.UpdateNew {
@@ -164,40 +144,41 @@ func (p *FreeDNSProvider) ApplyChanges(ctx context.Context, changes *plan.Change
 
 		var zoneRecord freedns.Record
 		// Avoid updating all service endpoints and just update the externalIP
-		// for _, target := range endpoint.Targets {
-		target, err := getPublicIP()
-		if err != nil {
-			return err
-		}
-		for _, zr := range zoneRecords {
-			if zr.Name == endpoint.DNSName && zr.Value == target {
-				zoneRecord = zr
-				break
+		for _, target := range endpoint.Targets {
+			if endpoint.RecordType == recordTypeA {
+				target = publicIP
+			}
+
+			for _, zr := range zoneRecords {
+				if zr.Name == endpoint.DNSName && zr.Value == target {
+					zoneRecord = zr
+					break
+				}
+			}
+
+			ttl := int(math.Max(minimumTTL, float64(endpoint.RecordTTL)))
+			log.WithFields(log.Fields{
+				"zoneId":     zoneId,
+				"zoneName":   zoneName,
+				"recordId":   zoneRecord.Id,
+				"dnsName":    endpoint.DNSName,
+				"recordType": endpoint.RecordType,
+				"target":     target,
+				"TTL":        ttl,
+			}).Infof("%sPatching record", dryRunText)
+			if p.DryRun {
+				continue
+			}
+
+			recordName := strings.TrimSuffix(endpoint.DNSName, "."+zoneName)
+			// Update DNS record
+			err = p.Client.UpdateRecord(zoneId, zoneRecord.Id, recordName, endpoint.RecordType, target, string(ttl))
+			if err != nil {
+				return err
 			}
 		}
-
-		ttl := int(math.Max(minimumTTL, float64(endpoint.RecordTTL)))
-		log.WithFields(log.Fields{
-			"zoneId":     zoneId,
-			"zoneName":   zoneName,
-			"recordId":   zoneRecord.Id,
-			"dnsName":    endpoint.DNSName,
-			"recordType": endpoint.RecordType,
-			"target":     target,
-			"TTL":        ttl,
-		}).Infof("%sPatching record", dryRunText)
-		if p.DryRun {
-			continue
-		}
-
-		recordName := strings.TrimSuffix(endpoint.DNSName, "."+zoneName)
-		// Update DNS record
-		err = p.Client.UpdateRecord(zoneId, zoneRecord.Id, recordName, endpoint.RecordType, target, string(ttl))
-		if err != nil {
-			return err
-		}
-		// }
 	}
+
 	for _, endpoint := range changes.Delete {
 		// As above, currently iterates in O(n^2). May be a good start for optimisations.
 		var zoneRecord freedns.Record
